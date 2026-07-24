@@ -36,3 +36,21 @@ frontend/test-results/
 .vscode/
 
 CLAUDE.md
+
+# Editor / IDE local config
+.obsidian/
+
+# H2 database files (runtime)
+*.mv.db
+*.trace.db
+
+# Python tooling caches & coverage
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Local env overrides (keep .env.example tracked)
+.env.local
+.env.production
