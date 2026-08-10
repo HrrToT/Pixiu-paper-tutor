@@ -1,2 +1,1 @@
-from app import app
-
+from app import app  # noqa: F401 (ASGI entry point for uvicorn)

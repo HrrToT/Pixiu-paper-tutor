@@ -17,9 +17,10 @@ import {
   summarizeReaderProfile,
 } from './components/backgroundKnowledgePanelModel.ts';
 import CodeExecutionApprovalCenter from './components/CodeExecutionApprovalCenter.jsx';
-import LibrarySidebar from './components/LibrarySidebar';
-import Navbar from './components/Navbar';
+const LibrarySidebar = React.lazy(() => import('./components/LibrarySidebar.jsx'));
+const Navbar = React.lazy(() => import('./components/Navbar.jsx'));
 import { ToastProvider, useToast } from './components/Toast.jsx';
+import { ErrorBoundary } from './components/ErrorBoundary';
 const ReadingIDE = React.lazy(() => import('./pages/ReadingIDE.jsx'));
 const AgentResearchPage = React.lazy(() => import('./pages/AgentResearchPage.jsx'));
 const SharedReportPage = React.lazy(() => import('./pages/SharedReportPage.jsx'));
@@ -189,6 +190,7 @@ export default function App() {
 
   const { theme, toggleTheme: handleToggleTheme } = useThemePreference(THEME_STORAGE_KEY);
   const { addToast } = useToast();
+  const [isOnline, setIsOnline] = useState(navigator.onLine);
   const [appMode, setAppMode] = useState('reader');
   const [pdfFile, setPdfFile] = useState(null);
   const [pdfFileName, setPdfFileName] = useState(null);
@@ -283,6 +285,17 @@ export default function App() {
   useEffect(() => {
     currentPdfIdRef.current = pdfId;
   }, [pdfId]);
+
+  useEffect(() => {
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
 
   useEffect(() => {
     setActiveWorkspaceSectionId(getWorkspaceSectionId(activeTab));
@@ -1250,6 +1263,9 @@ export default function App() {
     workspaceTabSections.find((section) => section.id === activeWorkspaceSectionId) || workspaceTabSections[0];
   const visibleWorkspaceTabs = workspaceTabs.filter((tab) => activeWorkspaceSection.tabIds.includes(tab.id));
   const currentPaperStatus = pdfFile ? (isDeconstructing ? '解析中' : '已载入') : '待上传';
+  const currentParseStatus = pdfId
+    ? (papersList.find((paper) => paper.id === pdfId)?.parseStatus || null)
+    : null;
   const currentResearchProgress = Math.round((currentDeepResearchState.task?.progress || 0) * 100);
   const paperOutlineModel = buildPaperOutlineModel(deconstructData);
   const paperOutlineItems = paperOutlineModel.items;
@@ -1335,8 +1351,9 @@ export default function App() {
   }
 
   return (
-    <>
+    <ErrorBoundary area="主应用">
       <CodeExecutionApprovalCenter />
+      <Suspense fallback={<div className="w-64 border-r" />}>
       <LibrarySidebar
         isOpen={isLibraryOpen}
         onClose={() => setIsLibraryOpen(false)}
@@ -1348,6 +1365,7 @@ export default function App() {
         onSelectPaper={handleSelectPaper}
         onDeletePaper={handleDeletePaper}
       />
+      </Suspense>
 
       {isAboutOpen && (
         <div className="fixed inset-0 z-[80] flex items-center justify-center bg-slate-950/35 p-4 backdrop-blur-sm">
@@ -1389,6 +1407,7 @@ export default function App() {
       )}
 
       <div className="theme-app-shell flex h-screen flex-col font-sans">
+        <Suspense fallback={<div className="h-12 border-b" />}>
         <Navbar
           isReady={isAiReady}
           theme={theme}
@@ -1400,6 +1419,16 @@ export default function App() {
           appMode={appMode}
           onAppModeChange={setAppMode}
         />
+        </Suspense>
+
+        {!isOnline && (
+          <div style={{
+            backgroundColor: '#f97316', color: '#fff', textAlign: 'center',
+            padding: '6px 12px', fontSize: '13px', fontWeight: 500,
+          }}>
+            网络连接已断开，部分功能不可用
+          </div>
+        )}
 
         <main className="workspace-main flex min-h-0 flex-1 overflow-hidden" aria-label="论文阅读工作区">
           <Suspense fallback={<div className="flex h-full w-full items-center justify-center text-muted">加载中...</div>}>
@@ -1419,6 +1448,7 @@ export default function App() {
               pdfPageState={pdfPageState}
               currentPaperStatus={currentPaperStatus}
               readingProgress={readingProgress}
+              parseStatus={currentParseStatus}
               notes={notes}
               papersList={papersList}
               handleSelectPaper={handleSelectPaper}
@@ -1519,7 +1549,7 @@ export default function App() {
           </Suspense>
         </main>
       </div>
-    </>
+    </ErrorBoundary>
   );
 }
 

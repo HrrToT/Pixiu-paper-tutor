@@ -14,7 +14,7 @@ Extracted from ``agent_langgraph.py`` (19-2) to keep the main module under
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any
 
 from services.agent_langgraph import AgentGraphState, _record
 from services.evidence_credibility import enrich_evidence_with_credibility
@@ -27,7 +27,7 @@ def evidence_weighing_node(state: AgentGraphState) -> AgentGraphState:
     same weights and formula are used by both the LangGraph and classic
     ``execute_run`` paths.
     """
-    evidence_items: List[Dict[str, Any]] = state.get("evidence_items", [])
+    evidence_items: list[dict[str, Any]] = state.get("evidence_items", [])
     _record(state, "evidence_weighing", f"Weighing {len(evidence_items)} evidence items")
 
     weighted = enrich_evidence_with_credibility(evidence_items)
@@ -51,12 +51,12 @@ def cross_paper_reasoning_node(state: AgentGraphState) -> AgentGraphState:
     Uses lightweight deterministic grouping + LLM flash-model call for
     semantic judgement (fails gracefully to rule-based fallback).
     """
-    weighted: List[Dict[str, Any]] = state.get("weighted_evidence", [])
-    paper_ids: List[str] = state.get("paper_ids", [])
+    weighted: list[dict[str, Any]] = state.get("weighted_evidence", [])
+    paper_ids: list[str] = state.get("paper_ids", [])
     _record(state, "cross_paper_reasoning",
             f"Reasoning across {len(paper_ids)} papers with {len(weighted)} weighted evidence items")
 
-    insights: Dict[str, Any] = {
+    insights: dict[str, Any] = {
         "consensus": [],
         "complementary": [],
         "contradictory": [],
@@ -73,13 +73,13 @@ def cross_paper_reasoning_node(state: AgentGraphState) -> AgentGraphState:
         return state
 
     # ── Deterministic grouping ────────────────────────────────────────────
-    by_paper: Dict[str, List[Dict[str, Any]]] = {}
+    by_paper: dict[str, list[dict[str, Any]]] = {}
     for item in weighted:
         pid = str(item.get("pdfId") or "unknown")
         by_paper.setdefault(pid, []).append(item)
 
     HIGH_THRESHOLD = 0.60
-    paper_claims: Dict[str, List[str]] = {}
+    paper_claims: dict[str, list[str]] = {}
     for pid, items in by_paper.items():
         high_cred = [it for it in items if it.get("credibility", {}).get("score", 0) >= HIGH_THRESHOLD]
         if high_cred:
@@ -106,7 +106,7 @@ def cross_paper_reasoning_node(state: AgentGraphState) -> AgentGraphState:
                             "claim_b": c2[:150],
                         })
 
-    covered_topics: Dict[str, set] = {}
+    covered_topics: dict[str, set] = {}
     for pid, claims in paper_claims.items():
         covered_topics[pid] = set()
         for c in claims:
@@ -189,14 +189,14 @@ def conflict_resolution_node(state: AgentGraphState) -> AgentGraphState:
     (14-3) — these MUST live in a real LangGraph *node* (not a conditional
     edge function) for state mutations to be persisted.
     """
-    conflicts: List[Dict[str, Any]] = state.get("conflicts", [])
-    weighted: List[Dict[str, Any]] = state.get("weighted_evidence", [])
+    conflicts: list[dict[str, Any]] = state.get("conflicts", [])
+    weighted: list[dict[str, Any]] = state.get("weighted_evidence", [])
     _record(state, "conflict_resolution", f"Resolving {len(conflicts)} conflicts")
 
-    resolved: List[Dict[str, Any]] = []
-    unresolved: List[Dict[str, Any]] = []
+    resolved: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
 
-    cred_by_source: Dict[str, float] = {}
+    cred_by_source: dict[str, float] = {}
     for item in weighted:
         sid = str(item.get("sourceId") or "")
         if sid:
@@ -294,3 +294,165 @@ def conflict_resolution_node(state: AgentGraphState) -> AgentGraphState:
     _record(state, "conflict_resolution",
             f"{len(resolved)} resolved, {len(unresolved)} need manual review")
     return state
+
+
+# ── Adversarial Verification Node (20-2) ─────────────────────────────
+
+
+def _generate_counter_hypotheses(
+    finding_summary: str,
+    timeout_seconds: int = 8,
+) -> list:
+    """Generate 1-2 counter-hypotheses for a finding.
+
+    Uses the translation (cheaper) LLM. On timeout or failure,
+    returns an empty list (fail-open: don't block the main pipeline).
+    """
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        from concurrent.futures import TimeoutError as FutureTimeout
+
+        from llm.client import get_translation_llm
+        from services.llm_cache import get_llm_cache
+
+        cache = get_llm_cache()
+        cached = cache.get(
+            "adversarial-counter-hypothesis", 0.1, "",
+            finding_summary[:200],
+        )
+        if cached is not None:
+            # cached is a JSON list of hypothesis strings
+            import json
+            try:
+                parsed = json.loads(cached)
+                if isinstance(parsed, list):
+                    return parsed[:2]
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        prompt = (
+            "You are a rigorous scientific reviewer. For the following "
+            "research finding, generate 1-2 specific counter-hypotheses "
+            "or potential weaknesses. Consider: sample size limitations, "
+            "methodological flaws, alternative explanations, confounding "
+            "variables, or generalizability concerns.\n\n"
+            f"Finding: {finding_summary}\n\n"
+            "Return ONLY the counter-hypotheses, one per line, "
+            "prefixed with '- '. Max 2 hypotheses."
+        )
+
+        llm = get_translation_llm()
+
+        def _call():
+            return llm._call(prompt)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_call)
+            result = future.result(timeout=timeout_seconds)
+
+        hypotheses = []
+        if result:
+            for line in str(result).split("\n"):
+                stripped = line.strip()
+                if stripped.startswith("- "):
+                    hypotheses.append(stripped[2:].strip())
+                elif stripped.startswith("-"):
+                    hypotheses.append(stripped[1:].strip())
+
+        result_list = hypotheses[:2]
+
+        # Cache result
+        import json
+        cache.put(
+            "adversarial-counter-hypothesis", 0.1, "",
+            finding_summary[:200],
+            json.dumps(result_list),
+        )
+
+        return result_list
+
+    except (FutureTimeout, Exception):
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(
+            "Counter-hypothesis generation failed for finding: %s",
+            finding_summary[:100],
+        )
+        return []
+
+
+def adversarial_verification_node(state: dict) -> dict:
+    """Adversarial verification node for the LangGraph agent pipeline.
+
+    For each finding:
+    1. Generate counter-hypotheses using cheaper LLM (8s timeout, fail-open).
+    2. Check evidence items for support/contradiction.
+    3. Assign status: verified | falsified | unverifiable.
+
+    Inserted between conflict_resolution's follow_up_decision "final_review"
+    path and the report node.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    findings = state.get("findings") or []
+    weighted_evidence = state.get("weighted_evidence") or []
+
+    verification_results = []
+
+    for finding in findings:
+        finding_id = finding.get("finding_id", "")
+        summary = finding.get("summary", "")
+        credibility = finding.get("credibility", 0.5)
+
+        # Generate counter-hypotheses (may use LLM or cache)
+        counter_hypotheses = _generate_counter_hypotheses(summary)
+
+        # Determine status based on evidence strength and credibility
+        source_ids = set(finding.get("sourceIds") or [])
+        supporting_evidence_count = 0
+        for ev in weighted_evidence:
+            if ev.get("sourceId") in source_ids:
+                ev_cred = ev.get("credibility", 0)
+                if isinstance(ev_cred, (int, float)) and ev_cred >= 0.5:
+                    supporting_evidence_count += 1
+
+        if counter_hypotheses and supporting_evidence_count == 0:
+            # Counter-hypotheses exist AND no supporting evidence
+            status = "unverifiable"
+        elif credibility < 0.4 and supporting_evidence_count == 0:
+            # Very low credibility with no supporting evidence
+            status = "falsified"
+        else:
+            # Sufficient evidence and credibility to verify
+            status = "verified"
+
+        verification_results.append({
+            "finding_id": finding_id,
+            "status": status,
+            "counter_hypothesis": (
+                counter_hypotheses[0] if counter_hypotheses else ""
+            ),
+            "evidence_ref": list(source_ids),
+        })
+
+    new_state = dict(state)
+    new_state["verification_results"] = verification_results
+
+    verified_count = sum(
+        1 for v in verification_results if v["status"] == "verified"
+    )
+    falsified_count = sum(
+        1 for v in verification_results if v["status"] == "falsified"
+    )
+    unverifiable_count = sum(
+        1 for v in verification_results if v["status"] == "unverifiable"
+    )
+    logger.info(
+        "Adversarial verification: %d verified, %d falsified, %d unverifiable",
+        verified_count,
+        falsified_count,
+        unverifiable_count,
+    )
+
+    return new_state

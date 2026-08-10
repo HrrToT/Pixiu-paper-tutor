@@ -2,6 +2,41 @@
 
 本记录用于追踪学术 AI 助手的功能迭代与优化。
 
+### 2026-07-28 v0.6.65
+
+**轨道二十一：PDF 阅读增强**
+
+1. **文本高亮与批注**：新建 `highlightStore.js` IndexedDB 持久化服务；PdfViewer 新增四色选择器（黄/绿/蓝/粉）、高亮颜色渲染、点击 tooltip（文本+颜色+时间+删除）、扫描件 PDF 自动禁用高亮。
+2. **阅读笔记侧栏**：新建 `ReadingNotesPanel.jsx` + `notesStore.js`，按章节目录组织笔记、textarea 编辑器、`[p.N]` 页码引用插入、点击引用跳转 PDF 页面、暗色模式兼容。
+3. **书签与阅读进度**：PdfViewer 工具栏新增星标书签按钮、书签列表在笔记面板子标签页展示、翻页自动保存阅读进度（debounce 2s）、重开论文弹出恢复位置提示。
+4. **标注导出**：笔记面板新增导出按钮，支持 Markdown 和 JSON 两种格式，不含 PDF 原文和敏感信息。
+
+**轨道二十二：质量收口**
+
+5. **前端性能优化**：ChartAnalysisCard 已改为 React.lazy 动态导入，recharts 独立 vendor chunk，logo 文件均在 20KB 以内。
+6. **错误边界与韧性**：`ErrorBoundary` 包裹 App 顶层，崩溃时展示错误空态+重试按钮；`api.ts` 新增 `withRetry` 通用重试（5xx/网络错误，指数退避 1s/2s）；离线检测全局橙色 banner。
+7. **测试覆盖率提升**：新增 `highlightStore` 10 个单元测试、`ReadingNotesPanel` 9 个组件测试、`multi-agent-debate.spec.js` 2 个 E2E、`pdf-annotation.spec.js` 2 个 E2E；vitest 总计 62 测试通过。
+
+### 2026-07-25 v0.6.64
+
+**轨道二十：多 Agent 辩论与交叉校验**
+
+1. **多 Agent 辩论编排器**：新建 `services/agent_debate.py`，`DebateOrchestrator` 支持 2-3 个独立 Agent 并行分析（不同 temperature 0.3/0.7/1.0），最多 2 轮交叉辩论，确定性 Jaccard 相似度计算与聚类，输出 consensus/dissent/unresolved 三类结果。
+2. **辩论 API**：新增 `POST /api/agent-projects/{projectId}/debate` 和 `GET /api/agent-projects/{projectId}/debate/{runId}` 端点，支持异步辩论执行与结果查询。
+3. **对抗性校验节点**：在 LangGraph 推理链 `conflict_resolution → report` 之间插入 `adversarial_verification_node`，对每个 finding 通过 LLM 生成反驳假设，结合证据强度评级为 verified/falsified/unverifiable，LLM 超时 8s 不阻塞主流程。
+4. **共识合成算法**：`synthesize_consensus` 确定性聚类 + 置信度计算公式（复用 `evidence_credibility.py` 的 credibility 评分），按置信度 ≥0.7/0.4-0.7/<0.4 分入 Consensus/Contested/Single-Source 三档，无额外 LLM 调用。
+5. **前端辩论可视化**：新建 `DebateView.jsx`，展示各方立场卡片（credibility 均值徽标）、证据对齐矩阵（✓/✗/~ 三态）、共识（绿）/争议（琥珀）/未解决（灰）三色区域，暗色模式兼容。
+
+### 2026-07-25 v0.6.63
+
+1. **前端 E2E 测试扩展（18-3）**：新增 3 个 Playwright E2E spec 文件——`agent-report-confidence.spec.js`（置信度徽标颜色与子标题边框验证）、`knowledge-graph-toggle.spec.js`（图谱开关状态与请求体验证）、`shared-report.spec.js`（分享页面有效/过期/无效 token 三态验证）；E2E 测试总数从 10 个扩展至 19 个。
+2. **文档与 benchmark 刷新（18-4）**：`README.md` 补充 Agent 推理管线、LLM 缓存、API 限流和分享功能说明；`ARCHITECTURE.md` 补充 Agent 推理管线（evidence_weighing/cross_paper_reasoning/conflict_resolution）和 follow-up 信息增益自适应终止逻辑；`docs/USER_GUIDE.md` 新增 Agent 报告阅读指南和分享功能使用说明；重跑 layout parser benchmark，更新 `docs/layout_parser_benchmark.md` 记录 16-1 修复后中文 PDF 章节检测现状。
+3. **PDF 阅读体验优化（19-3）**：`PdfViewer.tsx` 新增高亮偏移 scale 补偿、扫描件 PDF 文本选择禁用+提示、PDF 加载骨架屏（`PdfSkeleton.tsx`）、1024px 断点响应式侧边栏折叠；`App.jsx` / `ReadingIDE.jsx` 传递 `parseStatus` 和 `onNarrowScreenChange` 回调；`index.css` 新增骨架屏样式和响应式媒体查询。
+
+### 2026-07-25 v0.6.62
+
+1. **CI LangGraph 测试修复（18-1）**：`requirements.txt` 中 `langgraph` 版本约束从 `<1.0` 放宽至 `<2.0`，兼容 LangGraph 1.0.7；`run_agent_graph` 和 `resume_agent_graph` 均显式设置 `recursion_limit=50`，28 个 LangGraph agent 测试全通过。
+
 ### 2026-07-23 v0.6.61
 
 1. **部署与运维指南（19-4）**：新建 `docs/DEPLOYMENT.md`——覆盖裸机（gunicorn+nginx+systemd）和 Docker 两种部署方式；所有 `PIXIU_*` / `DEEPSEEK_*` 环境变量按必填/可选/默认值分类；6 个 SQLite 数据库持久化路径和备份策略；7 条安全建议。

@@ -35,6 +35,8 @@ frontend/test-results/
 
 .vscode/
 
+.superpowers/
+
 CLAUDE.md
 
 # Editor / IDE local config

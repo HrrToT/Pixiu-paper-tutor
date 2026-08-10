@@ -8,16 +8,16 @@ except ModuleNotFoundError:  # pragma: no cover - test-only fallback
     )
 
 from schemas.requests import (
+    AgentClarificationRequest,
+    AgentFinalReviewRequest,
+    AgentPlanReviewRequest,
     AgentProjectCreateRequest,
     AgentProjectPapersRequest,
     AgentProjectUpdateRequest,
     AgentRunCreateRequest,
-    AgentClarificationRequest,
     AgentRunFinalReviewRequest,
     AgentRunPlanReviewRequest,
     AgentTaskCreateRequest,
-    AgentFinalReviewRequest,
-    AgentPlanReviewRequest,
 )
 from services import (
     agent_artifact_service,
@@ -282,6 +282,7 @@ async def create_agent_graph(request: AgentRunCreateRequest):
     Returns the current graph state as an API response.
     """
     import uuid as _uuid
+
     from services.agent_langgraph import (
         agent_graph_state_to_response,
         run_agent_graph,
@@ -369,9 +370,9 @@ async def get_agent_graph(thread_id: str):
 async def create_project_share(project_id: str):
     """Create a read-only share token for a project's latest report (16-4)."""
     try:
-        from services.share_service import get_share_service
-        from services.agent_workspace_service import build_workspace_view
         from services.agent_state_repository import AgentStateRepository
+        from services.agent_workspace_service import build_workspace_view
+        from services.share_service import get_share_service
 
         repo = AgentStateRepository()
         workspace = build_workspace_view(repo, project_id)
@@ -414,4 +415,82 @@ async def get_shared_report(token: str):
         })
     except Exception as error:
         return JSONResponse({"status": "error", "message": str(error)}, status_code=500)
+
+
+# ── Multi-Agent Debate ───────────────────────────────────────────────
+
+@agent_router.post("/agent-projects/{project_id}/debate")
+async def create_debate(
+    project_id: str,
+    body: dict,
+):
+    """Create a multi-agent debate run for a project.
+
+    Request body:
+        - research_prompt: str (required)
+        - paper_ids: list[str] (required)
+        - constraints: dict | None (optional)
+        - num_agents: int (optional, default 3, max 5)
+
+    Returns DebateResult with consensus/dissent/unresolved findings.
+    """
+    research_prompt = (body.get("research_prompt") or "").strip()
+    if not research_prompt:
+        return JSONResponse(
+            {"status": "error", "message": "research_prompt is required"},
+            status_code=400,
+        )
+
+    paper_ids = body.get("paper_ids") or []
+    if not paper_ids:
+        return JSONResponse(
+            {"status": "error", "message": "paper_ids is required and must not be empty"},
+            status_code=400,
+        )
+
+    num_agents = body.get("num_agents", 3)
+    if not isinstance(num_agents, int) or num_agents < 1:
+        return JSONResponse(
+            {"status": "error", "message": "num_agents must be a positive integer"},
+            status_code=400,
+        )
+
+    from services.agent_project_service import create_debate_run
+
+    try:
+        result = create_debate_run(
+            project_id=project_id,
+            research_prompt=research_prompt,
+            paper_ids=paper_ids,
+            constraints=body.get("constraints"),
+            num_agents=min(num_agents, 5),
+        )
+        return JSONResponse({"status": "success", "data": result})
+    except ValueError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=404)
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.exception("Debate run failed for project %s", project_id)
+        return JSONResponse(
+            {"status": "error", "message": f"Debate run failed: {e!s}"},
+            status_code=500,
+        )
+
+
+@agent_router.get("/agent-projects/{project_id}/debate/{run_id}")
+async def get_debate_result_endpoint(
+    project_id: str,
+    run_id: str,
+):
+    """Retrieve a previously completed debate result."""
+    from services.agent_project_service import get_debate_result
+
+    result = get_debate_result(project_id, run_id)
+    if result is None:
+        return JSONResponse(
+            {"status": "error", "message": "Debate run not found"},
+            status_code=404,
+        )
+    return JSONResponse({"status": "success", "data": result})
 

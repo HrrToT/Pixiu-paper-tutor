@@ -1,27 +1,46 @@
 import os
+import re
 import shutil
 import tempfile
-import re
-from typing import Any, Dict, List
+from typing import Any
 
 from bs4 import BeautifulSoup
 from fastapi import UploadFile
+
+from core.pdf_quality import (
+    PARSE_STATUS_SCANNED_OR_LOW_TEXT,
+    _build_axis_terms,
+    _build_low_text_upload_response,
+    _build_parse_diagnostics,
+    _build_section_outline,
+    _count_non_whitespace_characters,
+    _extract_authors,
+    _extract_pdf_text_stats,
+    _extract_title,
+    _format_axis_prompt_block,  # noqa: F401 (re-exported for critical_reading)
+    _normalize_list_items,  # noqa: F401 (re-exported for critical_reading)
+    _score_document,
+    get_grobid_client,
+)
 
 try:
     from PyPDF2 import PdfReader
 except ImportError:  # pragma: no cover - deployment dependency guard
     PdfReader = None
 
+import logging
+
 from core.document_parser import extract_translation_layout_index, parse_tei_xml
 from core.outline_extractor import OUTLINE_VERSION, build_document_outline
 from llm.client import get_llm
-from rag.store import get_rag, is_rag_available, normalize_id, preload_rag
+from rag.store import get_rag, is_rag_available, normalize_id
 from schemas.requests import BackgroundKnowledgeRequest, DeepAnalysisRequest
-from services.background_knowledge_service import get_background_knowledge as build_background_knowledge
+from services.background_knowledge_service import (
+    get_background_knowledge as build_background_knowledge,
+)
 from services.evidence_service import (
     build_field_sentence_source_map,
     compact_evidence_for_response,
-    format_evidence_context,
     normalize_evidence_items,
 )
 from services.query_service import build_retrieval_queries
@@ -31,12 +50,17 @@ from services.safety_service import (
     summarize_safety_results,
     wrap_untrusted_context,
 )
-from services.trace_service import finalize_trace, record_counter, record_metric, sanitize_text, start_trace, trace_step
+from services.trace_service import (
+    finalize_trace,
+    record_counter,
+    record_metric,
+    sanitize_text,
+    start_trace,
+    trace_step,
+)
 from services.utils import parse_json_from_llm
 
-import logging
 _logger = logging.getLogger(__name__)
-
 
 _grobid_client = None
 ANALYSIS_CHUNK_SIZE = 1200
@@ -49,9 +73,6 @@ RAG_INDEX_UNAVAILABLE_ERROR_CODE = "rag_index_unavailable"
 PAPER_NOT_INDEXED_MESSAGE = "当前论文尚未完成全文索引，请重新上传或重新解析后再试。"
 RAG_INDEX_EMPTY_MESSAGE = "论文已解析，但没有可入库的正文片段，批判阅读暂不可用。请重新上传，或确认 PDF 是可提取文字的版本。"
 RAG_INDEX_UNAVAILABLE_MESSAGE = "论文已解析，但全文索引服务暂不可用，批判阅读暂不可用。请稍后重新解析或重启 AI 服务后再试。"
-PARSE_STATUS_PARSED = "parsed"
-PARSE_STATUS_SCANNED_OR_LOW_TEXT = "scanned_or_low_text"
-LOW_TEXT_PARSE_MESSAGE = "检测到的 PDF 文本量过低，可能是扫描件。请先执行 OCR 或更换文字版 PDF。"
 ANALYSIS_AXIS_CONFIGS = (
     {
         "key": "contributions",
@@ -145,7 +166,6 @@ NUMERIC_CHANGE_TERMS = [
     "降低",
 ]
 
-
 class PaperNotIndexedError(RuntimeError):
     def __init__(
         self,
@@ -159,8 +179,8 @@ class PaperNotIndexedError(RuntimeError):
         self.error_code = error_code
         self.trace_id: str | None = None
 
-    def to_response(self) -> Dict[str, Any]:
-        response: Dict[str, Any] = {
+    def to_response(self) -> dict[str, Any]:
+        response: dict[str, Any] = {
             "status": "error",
             "errorCode": self.error_code,
             "message": self.message,
@@ -171,167 +191,7 @@ class PaperNotIndexedError(RuntimeError):
             response["traceId"] = self.trace_id
         return response
 
-
-def get_grobid_client():
-    global _grobid_client
-
-    if _grobid_client is None:
-        from grobid_client.grobid_client import GrobidClient
-
-        _grobid_client = GrobidClient(
-            grobid_server=os.environ.get("GROBID_SERVER_URL", "http://grobid:8070"),
-            batch_size=1,
-            sleep_time=1,
-            timeout=60,
-        )
-
-    return _grobid_client
-
-
-def startup_warmup() -> None:
-    _logger.info("Starting AI service warmup...")
-    try:
-        preload_rag()
-        _logger.info("RAG backend is ready.")
-    except Exception as error:
-        _logger.info(f"RAG warmup skipped: {error}")
-
-
-def _extract_title(parsed_sections: list[dict], fallback_name: str) -> str:
-    if parsed_sections and parsed_sections[0].get("section") == "Front Matter (Metadata)":
-        for line in parsed_sections[0].get("content", "").splitlines():
-            if line.startswith("Title:"):
-                title = line.replace("Title:", "", 1).strip()
-                if title:
-                    return title
-    return fallback_name
-
-
-def _extract_authors(parsed_sections: list[dict]) -> list[str]:
-    if not parsed_sections or parsed_sections[0].get("section") != "Front Matter (Metadata)":
-        return []
-
-    for line in parsed_sections[0].get("content", "").splitlines():
-        if line.startswith("Authors:"):
-            authors = line.replace("Authors:", "", 1).strip()
-            return [author.strip() for author in authors.split(",") if author.strip()]
-
-    return []
-
-
-def _build_section_outline(parsed_sections: list[dict]) -> list[dict]:
-    outline: list[dict] = []
-    seen: set[str] = set()
-
-    for section in parsed_sections or []:
-        title = str(section.get("section") or "").strip()
-        if not title or title.lower() == "unknown" or title == "Front Matter (Metadata)":
-            continue
-
-        normalized = " ".join(title.lower().split())
-        normalized_key = "|".join(
-            [
-                normalized,
-                str(section.get("pageIndex") if section.get("pageIndex") is not None else ""),
-                str(section.get("parentId") or ""),
-            ]
-        )
-        if normalized_key in seen:
-            continue
-        seen.add(normalized_key)
-
-        content = str(section.get("content") or "").strip()
-        outline.append(
-            {
-                "id": section.get("id") or f"section-{len(outline) + 1}",
-                "title": title,
-                "type": "section",
-                "order": len(outline) + 1,
-                "preview": content[:180],
-                "pageIndex": section.get("pageIndex"),
-                "page": section.get("page"),
-                "level": section.get("level") or 1,
-                "nestedLevel": section.get("nestedLevel") or section.get("level") or 1,
-                "parentId": section.get("parentId"),
-                "headingNumber": section.get("headingNumber"),
-            }
-        )
-
-    return outline
-
-
-def _count_non_whitespace_characters(value: str) -> int:
-    return len(re.sub(r"\s+", "", str(value or "")))
-
-
-def _extract_pdf_text_stats(file_path: str) -> Dict[str, int]:
-    if PdfReader is None:
-        raise RuntimeError("PyPDF2 is required to diagnose PDF text content.")
-    reader = PdfReader(file_path)
-    extracted_text: list[str] = []
-    for page in reader.pages:
-        try:
-            extracted_text.append(page.extract_text() or "")
-        except Exception as error:
-            _logger.error(f"PDF text extraction skipped one page: {error}")
-    return {
-        "pageCount": len(reader.pages),
-        "textCharCount": _count_non_whitespace_characters("\n".join(extracted_text)),
-    }
-
-
-def _build_parse_diagnostics(
-    *, page_count: int, pdf_text_char_count: int, tei_text_char_count: int
-) -> Dict[str, Any]:
-    threshold = min(max(200, max(0, int(page_count or 0)) * 50), 2000)
-    max_text_char_count = max(
-        max(0, int(pdf_text_char_count or 0)),
-        max(0, int(tei_text_char_count or 0)),
-    )
-    diagnostics: Dict[str, Any] = {
-        "parseStatus": PARSE_STATUS_PARSED
-        if max_text_char_count >= threshold
-        else PARSE_STATUS_SCANNED_OR_LOW_TEXT,
-        "textThreshold": threshold,
-    }
-    if diagnostics["parseStatus"] == PARSE_STATUS_SCANNED_OR_LOW_TEXT:
-        diagnostics["parseMessage"] = LOW_TEXT_PARSE_MESSAGE
-    return diagnostics
-
-
-def _build_low_text_upload_response(filename: str, pdf_stats: Dict[str, int]) -> Dict[str, Any]:
-    diagnostics = _build_parse_diagnostics(
-        page_count=pdf_stats.get("pageCount", 0),
-        pdf_text_char_count=pdf_stats.get("textCharCount", 0),
-        tei_text_char_count=0,
-    )
-    empty_section_message = "未能从论文中提取足够文本，请先执行 OCR 或更换文字版 PDF。"
-    return {
-        "status": "success",
-        "paper_skeleton": {
-            key: empty_section_message
-            for key in ("abstract", "introduction", "methods", "results", "discussion", "conclusion")
-        },
-        "paper_structure": {
-            "error": "no_content",
-            "raw": "No usable text was extracted from the paper.",
-            "outlineVersion": "unavailable",
-            "sections": [],
-        },
-        "translationLayoutIndex": {},
-        "pdfId": normalize_id(filename),
-        "title": filename,
-        "authors": [],
-        "ragIndexed": False,
-        "ragChunkCount": 0,
-        "ragErrorCode": PAPER_NOT_INDEXED_ERROR_CODE,
-        "message": RAG_INDEX_EMPTY_MESSAGE,
-        "parseStatus": diagnostics["parseStatus"],
-        "parseMessage": diagnostics["parseMessage"],
-    }
-
-
-async def analyze_pdf(file: UploadFile) -> Dict[str, Any]:
+async def analyze_pdf(file: UploadFile) -> dict[str, Any]:
     input_dir = tempfile.mkdtemp()
     output_dir = tempfile.mkdtemp()
 
@@ -416,7 +276,7 @@ async def analyze_pdf(file: UploadFile) -> Dict[str, Any]:
             if len(text.strip()) > 50:
                 combined_context += f"### Section: {name.upper()}\nContent: {text.strip()[:2500]}\n\n"
 
-        paper_structure: Dict[str, Any] = {}
+        paper_structure: dict[str, Any] = {}
         if combined_context:
             summary_prompt = f"""
 You are a rigorous paper reader.
@@ -531,12 +391,10 @@ Paper context:
         if os.path.exists(output_dir):
             shutil.rmtree(output_dir)
 
-
-def get_background_knowledge(request: BackgroundKnowledgeRequest) -> Dict[str, Any]:
+def get_background_knowledge(request: BackgroundKnowledgeRequest) -> dict[str, Any]:
     return build_background_knowledge(request)
 
-
-def _chunk_text(text: str, chunk_size: int = ANALYSIS_CHUNK_SIZE, overlap: int = ANALYSIS_CHUNK_OVERLAP) -> List[str]:
+def _chunk_text(text: str, chunk_size: int = ANALYSIS_CHUNK_SIZE, overlap: int = ANALYSIS_CHUNK_OVERLAP) -> list[str]:
     value = str(text or "").strip()
     if not value:
         return []
@@ -556,8 +414,7 @@ def _chunk_text(text: str, chunk_size: int = ANALYSIS_CHUNK_SIZE, overlap: int =
         start = next_start
     return chunks
 
-
-def _build_inline_documents(paper_content: str) -> List[Dict[str, Any]]:
+def _build_inline_documents(paper_content: str) -> list[dict[str, Any]]:
     documents = []
     for index, chunk in enumerate(_chunk_text(paper_content)):
         documents.append({
@@ -569,8 +426,7 @@ def _build_inline_documents(paper_content: str) -> List[Dict[str, Any]]:
         })
     return normalize_evidence_items(documents, source_type="current_paper", max_text_chars=1800)
 
-
-def _load_analysis_source(request: DeepAnalysisRequest) -> tuple[List[Dict[str, Any]], str, str | None, str]:
+def _load_analysis_source(request: DeepAnalysisRequest) -> tuple[list[dict[str, Any]], str, str | None, str]:
     with trace_step(
         "load_analysis_source",
         meta={"hasInlineContent": bool(request.paper_content), "pdfId": sanitize_text(request.pdf_id, max_chars=80)},
@@ -609,13 +465,11 @@ def _load_analysis_source(request: DeepAnalysisRequest) -> tuple[List[Dict[str, 
 
         raise ValueError("Either paper_content or pdf_id is required.")
 
-
 def resolve_paper_content(request: DeepAnalysisRequest) -> tuple[str, str, str | None]:
     _, resolved_from, normalized_id, paper_content = _load_analysis_source(request)
     return paper_content, resolved_from, normalized_id
 
-
-def _build_analysis_context(documents: List[Dict[str, Any]], max_docs: int = 4, max_chars: int = 2400) -> str:
+def _build_analysis_context(documents: list[dict[str, Any]], max_docs: int = 4, max_chars: int = 2400) -> str:
     parts = []
     for item in documents[:max_docs]:
         text = str(item.get("text") or "").strip()
@@ -623,8 +477,7 @@ def _build_analysis_context(documents: List[Dict[str, Any]], max_docs: int = 4, 
             parts.append(text[:600])
     return "\n\n".join(parts)[:max_chars]
 
-
-def _extract_query_terms(text: str) -> List[str]:
+def _extract_query_terms(text: str) -> list[str]:
     tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9._-]{1,31}|[\u4e00-\u9fff]{2,12}", str(text or ""))
     results = []
     seen = set()
@@ -643,8 +496,7 @@ def _extract_query_terms(text: str) -> List[str]:
             results.append(cleaned)
     return results[:12]
 
-
-def _deduplicate_evidence(items: List[Dict[str, Any]], limit: int | None = None) -> List[Dict[str, Any]]:
+def _deduplicate_evidence(items: list[dict[str, Any]], limit: int | None = None) -> list[dict[str, Any]]:
     deduped = []
     seen = set()
     for item in items:
@@ -657,59 +509,18 @@ def _deduplicate_evidence(items: List[Dict[str, Any]], limit: int | None = None)
             break
     return deduped
 
-
-def _merge_evidence_lists(*groups: List[Dict[str, Any]], limit: int | None = None) -> List[Dict[str, Any]]:
+def _merge_evidence_lists(*groups: list[dict[str, Any]], limit: int | None = None) -> list[dict[str, Any]]:
     merged = []
     for group in groups:
         merged.extend(group or [])
     return _deduplicate_evidence(merged, limit=limit)
 
-
-def _build_axis_terms(query_plan: Dict[str, Any], axis: Dict[str, Any]) -> List[str]:
-    terms = []
-    seen = set()
-    for raw in [
-        *(query_plan.get("keywords") or []),
-        *axis.get("seed_terms", []),
-        *_extract_query_terms(query_plan.get("rewritten") or ""),
-        *_extract_query_terms(query_plan.get("original") or ""),
-    ]:
-        term = " ".join(str(raw or "").strip().split())
-        if len(term) < 2:
-            continue
-        key = term.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        terms.append(term[:80])
-        if len(terms) >= 12:
-            break
-    return terms
-
-
-def _score_document(text: str, terms: List[str]) -> tuple[float, List[str]]:
-    lowered = str(text or "").lower()
-    matched_terms = []
-    for term in terms:
-        if term.lower() in lowered:
-            matched_terms.append(term)
-
-    if not matched_terms:
-        return 0.0, []
-
-    coverage = len(matched_terms) / len(terms) if terms else 0.0
-    score = len(matched_terms) * 1.6
-    score += coverage * 2.0
-    score += min(len(lowered) / 1200, 1.0) * 0.4
-    return score, matched_terms
-
-
 def _retrieve_axis_evidence(
-    documents: List[Dict[str, Any]],
-    query_plan: Dict[str, Any],
-    axis: Dict[str, Any],
+    documents: list[dict[str, Any]],
+    query_plan: dict[str, Any],
+    axis: dict[str, Any],
     limit: int = ANALYSIS_RETRIEVAL_LIMIT,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     with trace_step(
         f"axis_{axis.get('key')}_retrieve",
         input_size=len(documents),
@@ -751,14 +562,12 @@ def _retrieve_axis_evidence(
         step["outputSize"] = len(deduped)
         return deduped
 
-
-def _should_retry_retrieval(judge_result: Dict[str, Any]) -> bool:
+def _should_retry_retrieval(judge_result: dict[str, Any]) -> bool:
     return MAX_RETRIEVAL_RETRIES > 0 and bool(judge_result.get("shouldRetry")) and (
         judge_result.get("verdict") != "CORRECT" or float(judge_result.get("confidence") or 0) < 0.68
     )
 
-
-def _build_retry_query(question: str, query_plan: Dict[str, Any], axis: Dict[str, Any], judge_result: Dict[str, Any]) -> str:
+def _build_retry_query(question: str, query_plan: dict[str, Any], axis: dict[str, Any], judge_result: dict[str, Any]) -> str:
     parts = [
         query_plan.get("original") or question,
         query_plan.get("rewritten") or "",
@@ -781,12 +590,11 @@ def _build_retry_query(question: str, query_plan: Dict[str, Any], axis: Dict[str
 
     return " ".join(unique_parts)[:500] or question
 
-
 def _analyze_axis(
-    axis: Dict[str, Any],
-    documents: List[Dict[str, Any]],
+    axis: dict[str, Any],
+    documents: list[dict[str, Any]],
     analysis_context: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     question = axis["question"]
     with trace_step(
         f"axis_{axis.get('key')}_query_plan",
@@ -848,68 +656,14 @@ def _analyze_axis(
         "evidence": evidence,
     }
 
-
-def _format_axis_prompt_block(axis_result: Dict[str, Any]) -> str:
-    judge = axis_result.get("judge") or {}
-    evidence_block = format_evidence_context(
-        axis_result.get("evidence") or [],
-        title=f"{axis_result.get('label')}证据",
-        max_items=4,
-        max_text_chars=450,
-    ) or "\n\n证据片段：\n- 当前未检索到相关证据。"
-    evidence_safety = wrap_untrusted_context(
-        f"{axis_result.get('label')} evidence",
-        evidence_block,
-        max_tokens=1200,
-    )
-
-    return (
-        f"## {axis_result.get('label')}\n"
-        f"问题：{axis_result.get('question')}\n"
-        f"queryPlan: {axis_result.get('queryPlan')}\n"
-        f"judge: verdict={judge.get('verdict')} confidence={judge.get('confidence')} "
-        f"reason={judge.get('reason')} missing={judge.get('missingAspects')}\n"
-        f"{evidence_safety['wrapped']}\n"
-    )
-
-
-def _normalize_list_items(value: Any, fallback: List[str]) -> List[str]:
-    if isinstance(value, list):
-        raw_items = [str(item).strip() for item in value]
-    elif isinstance(value, str):
-        raw_items = [
-            line.strip("-* 0123456789.、 \t")
-            for line in value.splitlines()
-        ]
-    else:
-        raw_items = []
-
-    items = []
-    seen = set()
-    for item in raw_items or fallback:
-        text = " ".join(str(item or "").strip().split())
-        if not text:
-            continue
-        key = text.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        items.append(text[:160])
-        if len(items) >= 6:
-            break
-    return items
-
-
 def _normalize_text_value(value: Any, fallback: str) -> str:
     text = " ".join(str(value or "").strip().split())
     return text or fallback
 
-
-def _axis_result_map(axis_results: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+def _axis_result_map(axis_results: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return {item["key"]: item for item in axis_results}
 
-
-def _fallback_claimed_contributions(axis_results: List[Dict[str, Any]]) -> str:
+def _fallback_claimed_contributions(axis_results: list[dict[str, Any]]) -> str:
     contributions = _axis_result_map(axis_results).get("contributions", {})
     evidence = contributions.get("evidence") or []
     if not evidence:
@@ -920,8 +674,7 @@ def _fallback_claimed_contributions(axis_results: List[Dict[str, Any]]) -> str:
         lines.append(f"- {str(item.get('text') or '')[:120]}")
     return "\n".join(lines)
 
-
-def _fallback_evidence_based_contributions(axis_results: List[Dict[str, Any]]) -> str:
+def _fallback_evidence_based_contributions(axis_results: list[dict[str, Any]]) -> str:
     axis_map = _axis_result_map(axis_results)
     evidence = _merge_evidence_lists(
         axis_map.get("contributions", {}).get("evidence") or [],
@@ -937,8 +690,7 @@ def _fallback_evidence_based_contributions(axis_results: List[Dict[str, Any]]) -
         lines.append(f"- {str(item.get('text') or '')[:120]}")
     return "\n".join(lines)
 
-
-def _fallback_weaknesses(axis_results: List[Dict[str, Any]]) -> List[str]:
+def _fallback_weaknesses(axis_results: list[dict[str, Any]]) -> list[str]:
     axis_map = _axis_result_map(axis_results)
     weaknesses = []
     if (axis_map.get("methods", {}).get("judge") or {}).get("verdict") != "CORRECT":
@@ -949,8 +701,7 @@ def _fallback_weaknesses(axis_results: List[Dict[str, Any]]) -> List[str]:
         weaknesses.append("局限性或失败情形披露不充分，风险边界不够清晰。")
     return weaknesses
 
-
-def _fallback_overclaim_risks(axis_results: List[Dict[str, Any]]) -> List[str]:
+def _fallback_overclaim_risks(axis_results: list[dict[str, Any]]) -> list[str]:
     axis_map = _axis_result_map(axis_results)
     risks = []
     if (axis_map.get("contributions", {}).get("judge") or {}).get("verdict") != "CORRECT":
@@ -963,8 +714,7 @@ def _fallback_overclaim_risks(axis_results: List[Dict[str, Any]]) -> List[str]:
         risks.append("部分方法创新点缺少足够机制性证据，可能存在贡献重包装风险。")
     return risks
 
-
-def _fallback_missing_evidence(axis_results: List[Dict[str, Any]]) -> List[str]:
+def _fallback_missing_evidence(axis_results: list[dict[str, Any]]) -> list[str]:
     missing = []
     seen = set()
     for axis_result in axis_results:
@@ -980,7 +730,6 @@ def _fallback_missing_evidence(axis_results: List[Dict[str, Any]]) -> List[str]:
         missing.append(text[:160])
     return missing
 
-
 from services.critical_reading import (
     _attach_numeric_evidence_to_claims,
     _build_claim_support_items,
@@ -989,7 +738,8 @@ from services.critical_reading import (
     _generate_structured_critical_report,
 )
 
-def deep_analysis(request: DeepAnalysisRequest) -> Dict[str, Any]:
+
+def deep_analysis(request: DeepAnalysisRequest) -> dict[str, Any]:
     trace_id = start_trace(
         "critical",
         request_meta={
